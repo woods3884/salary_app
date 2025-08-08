@@ -146,3 +146,4 @@ def generate_pdf(df):
 if st.button("📄 PDFレポートを生成"):
     pdf_data = generate_pdf(pd.DataFrame(st.session_state.entries))
     st.download_button("⬇️ ダウンロード", data=pdf_data, file_name="salary_report.pdf", mime="application/pdf")
+# 2025-08-09 push test
