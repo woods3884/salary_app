@@ -11,10 +11,14 @@ from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 
 st.title("🚖 タクシー給与予測アプリ")
 
-# ===== 永続化：Railway Volume =====
-DATA_DIR = Path("/app/data")  # Railway のボリュームマウント先
+# ====== 永続化（Railway Volume） ======
+DATA_DIR = Path("/app/data")
 DATA_DIR.mkdir(exist_ok=True)
 CSV_PATH = DATA_DIR / "entries.csv"
+
+# アーカイブ（15日締め）
+ARCHIVE_DIR = DATA_DIR / "archive"
+ARCHIVE_DIR.mkdir(exist_ok=True)
 
 COLUMNS = ["日付", "営収", "出庫時刻", "帰庫時刻"]
 
@@ -37,7 +41,7 @@ def save_entries(entries):
     except Exception as e:
         st.error(f"CSV保存に失敗しました: {e}")
 
-# ===== ヘルパー =====
+# ====== ヘルパー ======
 def _fmt_date(v):
     if isinstance(v, DateType): return v.strftime("%Y-%m-%d")
     return pd.to_datetime(v).date().strftime("%Y-%m-%d")
@@ -46,16 +50,32 @@ def _fmt_time(v):
     if isinstance(v, TimeType): return v.strftime("%H:%M")
     return pd.to_datetime(v).time().strftime("%H:%M")
 
-# ===== セッション初期化 =====
+def period_16to15(today: DateType):
+    """今日を基準に直近の 16日〜翌月15日の (開始日, 終了日) を返す"""
+    base = pd.Timestamp(today)
+    if base.day >= 16:
+        start = pd.Timestamp(base.year, base.month, 16)
+        end_m = base + pd.offsets.MonthBegin(1)
+        end = pd.Timestamp(end_m.year, end_m.month, 15)
+    else:
+        prev = base - pd.offsets.MonthBegin(1)
+        start = pd.Timestamp(prev.year, prev.month, 16)
+        end = pd.Timestamp(base.year, base.month, 15)
+    return start.date(), end.date()
+
+def archive_filename(start_d: DateType, end_d: DateType):
+    return ARCHIVE_DIR / f"entries_{start_d.isoformat()}_{end_d.isoformat()}.csv"
+
+# ====== セッション初期化 ======
 ss = st.session_state
 if "entries" not in ss:
     ss.entries = load_entries()
 if "show_editor" not in ss:
     ss.show_editor = False
 if "row_edit_idx" not in ss:
-    ss.row_edit_idx = None  # 行ごと編集の対象インデックス
+    ss.row_edit_idx = None  # 行別編集ターゲット
 
-# ===== 入力フォーム =====
+# ====== 入力フォーム ======
 st.markdown("### 📋 データ入力フォーム")
 with st.form("input_form"):
     col1, col2, col3, col4 = st.columns(4)
@@ -79,12 +99,11 @@ if submitted:
     save_entries(ss.entries)
     st.success("追加しました。")
 
-# ===== 一覧・削除・編集（行ごと） =====
+# ====== 一覧・行別編集／削除（エントリがあるときだけ） ======
 if ss.entries:
-    df = pd.DataFrame(ss.entries)
-
+    df_list = pd.DataFrame(ss.entries)
     st.markdown("### 📝 入力済みデータ（行ごと編集/削除）")
-    for idx, row in df.iterrows():
+    for idx, row in df_list.iterrows():
         cols = st.columns([2, 2, 2, 2, 1.2, 1])
         cols[0].write(row["日付"])
         cols[1].write(f"¥{int(row['営収']):,}")
@@ -101,7 +120,7 @@ if ss.entries:
             st.success("削除しました。")
             st.rerun()
 
-    # ── 選択行の編集フォーム ──
+    # ── 行別編集フォーム ──
     if ss.row_edit_idx is not None and 0 <= ss.row_edit_idx < len(ss.entries):
         i = ss.row_edit_idx
         target = ss.entries[i]
@@ -146,7 +165,7 @@ if ss.entries:
             st.info("編集をキャンセルしました。")
             st.rerun()
 
-    # ── 一括編集グリッド（従来機能・任意） ──
+    # ── 一括編集グリッド（任意） ──
     st.markdown("### 🧰 一覧をまとめて編集（任意）")
     btn_cols = st.columns([1, 4])
     if not ss.show_editor:
@@ -192,10 +211,10 @@ if ss.entries:
             st.info("編集を破棄しました。")
             st.rerun()
 
-    # ===== 集計 =====
-    df = pd.DataFrame(ss.entries).copy()
+# ====== 集計（常に安全に計算） ======
+df = pd.DataFrame(ss.entries).copy()
+if not df.empty:
     df["深夜時間(h)"], df["超過時間(h)"] = 0.0, 0.0
-
     for i, row in df.iterrows():
         out_time = datetime.strptime(f"{row['日付']} {row['出庫時刻']}", "%Y-%m-%d %H:%M")
         in_time = datetime.strptime(f"{row['日付']} {row['帰庫時刻']}", "%Y-%m-%d %H:%M")
@@ -215,72 +234,115 @@ if ss.entries:
         df.at[i, "深夜時間(h)"] = round(night_h, 2)
         df.at[i, "超過時間(h)"] = round(over_h, 2)
 
-    st.markdown("### 📊 入力済みデータ")
-    st.dataframe(df, use_container_width=True)
+st.markdown("### 📊 入力済みデータ")
+st.dataframe(df if not df.empty else pd.DataFrame(columns=COLUMNS + ["深夜時間(h)", "超過時間(h)"]),
+             use_container_width=True)
 
-    # ===== 給与計算 =====
-    total_sales = int(df["営収"].sum())
-    night_hours = float(df["深夜時間(h)"].sum())
-    over_hours = float(df["超過時間(h)"].sum())
+# ====== 給与計算（dfが空でも0で表示） ======
+total_sales = int(df["営収"].sum()) if not df.empty else 0
+night_hours = float(df["深夜時間(h)"].sum()) if "深夜時間(h)" in df else 0.0
+over_hours  = float(df["超過時間(h)"].sum())  if "超過時間(h)" in df  else 0.0
 
-    rate_table = {
-        900000: 508712, 850000: 471015, 800000: 438359, 750000: 404286,
-        700000: 369718, 650000: 329678, 600000: 288907, 550000: 252054,
-        500000: 211921, 450000: 170255, 400000: 122505
-    }
-    base_pay = 0
-    for thr, amt in sorted(rate_table.items(), reverse=True):
-        if total_sales >= thr:
-            base_pay = amt
-            break
+rate_table = {
+    900000: 508712, 850000: 471015, 800000: 438359, 750000: 404286,
+    700000: 369718, 650000: 329678, 600000: 288907, 550000: 252054,
+    500000: 211921, 450000: 170255, 400000: 122505
+}
+base_pay = 0
+for thr, amt in sorted(rate_table.items(), reverse=True):
+    if total_sales >= thr:
+        base_pay = amt
+        break
 
-    night_pay = int(night_hours * 600)
-    over_pay = int(over_hours * 250)
-    total_pay = base_pay + night_pay + over_pay
-    deduction = int(total_pay * 0.115)
-    take_home = total_pay - deduction
+night_pay = int(night_hours * 600)
+over_pay  = int(over_hours * 250)
+total_pay = base_pay + night_pay + over_pay
+deduction = int(total_pay * 0.115)
+take_home = total_pay - deduction
 
-    st.markdown("### 💰 給与予測結果")
-    st.write(f"総営収：¥{total_sales:,}")
-    st.write(f"歩合給（基準額）：¥{base_pay:,}")
-    st.write(f"深夜手当：¥{night_pay:,}（{night_hours:.1f}時間）")
-    st.write(f"超過手当：¥{over_pay:,}（{over_hours:.1f}時間）")
-    st.write(f"支給合計：¥{total_pay:,}")
-    st.write(f"控除（11.5%）：¥{deduction:,}")
-    st.success(f"👉 手取り見込み：¥{take_home:,}")
+st.markdown("### 💰 給与予測結果")
+st.write(f"総営収：¥{total_sales:,}")
+st.write(f"歩合給（基準額）：¥{base_pay:,}")
+st.write(f"深夜手当：¥{night_pay:,}（{night_hours:.1f}時間）")
+st.write(f"超過手当：¥{over_pay:,}（{over_hours:.1f}時間）")
+st.write(f"支給合計：¥{total_pay:,}")
+st.write(f"控除（11.5%）：¥{deduction:,}")
+st.success(f"👉 手取り見込み：¥{take_home:,}")
 
-    # ===== PDF 出力 =====
-    def generate_pdf(df_src, total_sales, base_pay, night_pay, night_hours, over_pay, over_hours, deduction, take_home):
-        buf = BytesIO()
-        pdfmetrics.registerFont(UnicodeCIDFont('HeiseiKakuGo-W5'))
-        c = canvas.Canvas(buf, pagesize=A4)
-        width, height = A4
-        c.setFont('HeiseiKakuGo-W5', 12)
+# ====== 15日締め：保存してクリア（常に表示） ======
+st.markdown("### 🗂 15日締め（保存してクリア）")
+today = datetime.today().date()
+p_start, p_end = period_16to15(today)
+st.caption(f"対象期間: {p_start} ～ {p_end}（毎月16日開始〜翌月15日締め）")
 
-        c.drawString(50, height-50, "🚖 タクシー給与レポート")
-        start = str(pd.to_datetime(df_src["日付"]).min().date()) if not df_src.empty else "-"
-        end   = str(pd.to_datetime(df_src["日付"]).max().date()) if not df_src.empty else "-"
-        c.drawString(50, height-80, f"対象期間：{start} ～ {end}")
-
-        ypos = height-120
-        c.drawString(50, ypos, f"総営収：¥{total_sales:,}"); ypos -= 20
-        c.drawString(50, ypos, f"歩合給：¥{base_pay:,}"); ypos -= 20
-        c.drawString(50, ypos, f"深夜手当：¥{night_pay:,}（{night_hours:.1f}h）"); ypos -= 20
-        c.drawString(50, ypos, f"超過手当：¥{over_pay:,}（{over_hours:.1f}h）"); ypos -= 20
-        c.drawString(50, ypos, f"控除：¥{deduction:,}"); ypos -= 20
-        c.drawString(50, ypos, f"手取り見込み：¥{take_home:,}")
-
-        c.showPage()
-        c.save()
-        buf.seek(0)
-        return buf
-
-    if st.button("📄 PDFレポートを生成"):
-        pdf_data = generate_pdf(
-            pd.DataFrame(ss.entries),
-            total_sales, base_pay, night_pay, night_hours, over_pay, over_hours, deduction, take_home
-        )
-        st.download_button("⬇️ ダウンロード", data=pdf_data, file_name="salary_report.pdf", mime="application/pdf")
-
+df_entries = pd.DataFrame(ss.entries)
+if not df_entries.empty:
+    df_entries["日付_dt"] = pd.to_datetime(df_entries["日付"]).dt.date
+    mask = (df_entries["日付_dt"] >= p_start) & (df_entries["日付_dt"] <= p_end)
+    df_to_save = df_entries.loc[mask, COLUMNS]
 else:
-    st.info("まだデータがありません。上のフォームから追加してください。")
+    mask = pd.Series([], dtype=bool)
+    df_to_save = pd.DataFrame(columns=COLUMNS)
+
+colA, colB = st.columns([1.4, 2])
+do_close = colA.button("📦 この期間を保存してクリア")
+if do_close:
+    if df_to_save.empty:
+        st.warning("対象期間のデータがありません。保存は行いませんでした。")
+    else:
+        out_path = archive_filename(p_start, p_end)
+        df_to_save.to_csv(out_path, index=False, encoding="utf-8-sig")
+        # 対象分のみ削除
+        remain = df_entries.loc[~mask, COLUMNS].to_dict(orient="records") if not df_entries.empty else []
+        ss.entries = remain
+        save_entries(ss.entries)
+        st.success(f"保存しました：{out_path.name}。対象分をクリアしました。")
+        st.rerun()
+
+st.markdown("#### 📚 アーカイブ一覧")
+arch_files = sorted(ARCHIVE_DIR.glob("entries_*.csv"))
+if not arch_files:
+    st.caption("まだアーカイブはありません。")
+else:
+    for p in arch_files[::-1]:
+        with open(p, "rb") as f:
+            st.download_button(
+                label=f"⬇️ {p.name}",
+                data=f.read(),
+                file_name=p.name,
+                mime="text/csv",
+                key=f"dl_{p.name}"
+            )
+
+# ====== PDF 出力 ======
+def generate_pdf(df_src, total_sales, base_pay, night_pay, night_hours, over_pay, over_hours, deduction, take_home):
+    buf = BytesIO()
+    pdfmetrics.registerFont(UnicodeCIDFont('HeiseiKakuGo-W5'))
+    c = canvas.Canvas(buf, pagesize=A4)
+    width, height = A4
+    c.setFont('HeiseiKakuGo-W5', 12)
+
+    c.drawString(50, height-50, "🚖 タクシー給与レポート")
+    start = str(pd.to_datetime(df_src["日付"]).min().date()) if not df_src.empty else "-"
+    end   = str(pd.to_datetime(df_src["日付"]).max().date()) if not df_src.empty else "-"
+    c.drawString(50, height-80, f"対象期間：{start} ～ {end}")
+
+    ypos = height-120
+    c.drawString(50, ypos, f"総営収：¥{total_sales:,}"); ypos -= 20
+    c.drawString(50, ypos, f"歩合給：¥{base_pay:,}"); ypos -= 20
+    c.drawString(50, ypos, f"深夜手当：¥{night_pay:,}（{night_hours:.1f}h）"); ypos -= 20
+    c.drawString(50, ypos, f"超過手当：¥{over_pay:,}（{over_hours:.1f}h）"); ypos -= 20
+    c.drawString(50, ypos, f"控除：¥{deduction:,}"); ypos -= 20
+    c.drawString(50, ypos, f"手取り見込み：¥{take_home:,}")
+
+    c.showPage()
+    c.save()
+    buf.seek(0)
+    return buf
+
+if st.button("📄 PDFレポートを生成"):
+    pdf_data = generate_pdf(
+        pd.DataFrame(ss.entries),
+        total_sales, base_pay, night_pay, night_hours, over_pay, over_hours, deduction, take_home
+    )
+    st.download_button("⬇️ ダウンロード", data=pdf_data, file_name="salary_report.pdf", mime="application/pdf")
