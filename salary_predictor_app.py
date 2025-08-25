@@ -22,6 +22,7 @@ ARCHIVE_DIR.mkdir(exist_ok=True)
 
 COLUMNS = ["日付", "営収", "出庫時刻", "帰庫時刻"]
 
+# ====== CSV読込・保存 ======
 def load_entries():
     if CSV_PATH.exists():
         try:
@@ -99,7 +100,7 @@ if submitted:
     save_entries(ss.entries)
     st.success("追加しました。")
 
-# ====== 一覧・行別編集／削除 ======
+# ====== 一覧・編集 ======
 if ss.entries:
     df_list = pd.DataFrame(ss.entries)
     st.markdown("### 📝 入力済みデータ（行ごと編集/削除）")
@@ -120,98 +121,7 @@ if ss.entries:
             st.success("削除しました。")
             st.rerun()
 
-    # ── 行別編集フォーム ──
-    if ss.row_edit_idx is not None and 0 <= ss.row_edit_idx < len(ss.entries):
-        i = ss.row_edit_idx
-        target = ss.entries[i]
-
-        st.divider()
-        st.markdown(f"#### ✏️ 行を編集（{target['日付']}）")
-
-        _date  = pd.to_datetime(target["日付"]).date()
-        _dep   = pd.to_datetime(target["出庫時刻"], format="%H:%M").time()
-        _ret   = pd.to_datetime(target["帰庫時刻"], format="%H:%M").time()
-        _sales = int(target["営収"])
-
-        with st.form(f"row_edit_form_{i}", clear_on_submit=False):
-            c1, c2, c3, c4 = st.columns(4)
-            with c1:
-                date_ev = st.date_input("日付", value=_date, key=f"edit_date_{i}")
-            with c2:
-                revenue_ev = st.number_input("営収（円）", min_value=0, step=1000, value=_sales, key=f"edit_rev_{i}")
-            with c3:
-                departure_ev = st.time_input("出庫時刻", value=_dep, key=f"edit_dep_{i}")
-            with c4:
-                return_ev = st.time_input("帰庫時刻", value=_ret, key=f"edit_ret_{i}")
-
-            save_col, cancel_col = st.columns(2)
-            save_clicked = save_col.form_submit_button("✅ 保存", type="primary")
-            cancel_clicked = cancel_col.form_submit_button("↩️ キャンセル")
-
-        if save_clicked:
-            ss.entries[i] = {
-                "日付": _fmt_date(date_ev),
-                "営収": int(revenue_ev),
-                "出庫時刻": _fmt_time(departure_ev),
-                "帰庫時刻": _fmt_time(return_ev),
-            }
-            save_entries(ss.entries)
-            ss.row_edit_idx = None
-            st.success("更新しました。")
-            st.rerun()
-
-        if cancel_clicked:
-            ss.row_edit_idx = None
-            st.info("編集をキャンセルしました。")
-            st.rerun()
-
-    # ── 一括編集グリッド（任意） ──
-    st.markdown("### 🧰 一覧をまとめて編集（任意）")
-    btn_cols = st.columns([1, 4])
-    if not ss.show_editor:
-        if btn_cols[0].button("✏️ グリッド編集を開く"):
-            ss.show_editor = True
-            st.rerun()
-    else:
-        btn_cols[0].write("編集中…（保存 or キャンセルを押してください）")
-        df_edit = pd.DataFrame(ss.entries).copy()
-        df_edit["日付"] = pd.to_datetime(df_edit["日付"]).dt.date
-        df_edit["出庫時刻"] = pd.to_datetime(df_edit["出庫時刻"], format="%H:%M").dt.time
-        df_edit["帰庫時刻"] = pd.to_datetime(df_edit["帰庫時刻"], format="%H:%M").dt.time
-
-        edited = st.data_editor(
-            df_edit, hide_index=True, use_container_width=True, num_rows="fixed",
-            column_config={
-                "日付": st.column_config.DateColumn("日付", format="YYYY-MM-DD"),
-                "営収": st.column_config.NumberColumn("営収（円）", min_value=0, step=1000),
-                "出庫時刻": st.column_config.TimeColumn("出庫時刻"),
-                "帰庫時刻": st.column_config.TimeColumn("帰庫時刻"),
-            },
-            key="editor_grid",
-        )
-
-        save_col, cancel_col = st.columns(2)
-        if save_col.button("✅ 変更を保存", type="primary"):
-            ss.entries = [
-                {
-                    "日付": _fmt_date(r["日付"]),
-                    "営収": int(r["営収"]) if pd.notna(r["営収"]) else 0,
-                    "出庫時刻": _fmt_time(r["出庫時刻"]),
-                    "帰庫時刻": _fmt_time(r["帰庫時刻"]),
-                }
-                for _, r in edited.iterrows()
-            ]
-            save_entries(ss.entries)
-            ss.show_editor = False
-            st.success("保存しました。")
-            st.rerun()
-
-        if cancel_col.button("↩️ キャンセル"):
-            ss.show_editor = False
-            st.info("編集を破棄しました。")
-            st.rerun()
-
-# ====== 集計（常に安全に計算） ======
+# ====== 集計 ======
 df = pd.DataFrame(ss.entries).copy()
 if not df.empty:
     df["深夜時間(h)"], df["超過時間(h)"] = 0.0, 0.0
@@ -234,104 +144,34 @@ if not df.empty:
         df.at[i, "深夜時間(h)"] = round(night_h, 2)
         df.at[i, "超過時間(h)"] = round(over_h, 2)
 
-st.markdown("### 📊 入力済みデータ")
-st.dataframe(df if not df.empty else pd.DataFrame(columns=COLUMNS + ["深夜時間(h)", "超過時間(h)"]),
-             use_container_width=True)
-
-# ====== 歩合基準テーブルの読み込み & 基準額計算 ======
-def load_rate_table():
-    """
-    優先順で歩合基準を読み込む:
-      1) リポジトリ同梱の '稼高水準別基準額と歩率.csv'
-      2) DATA_DIR 配下の 'rate_table.csv'
-      3) 既定のフォールバック
-
-    CSV 例（ヘッダは日本語/英語どちらでもOK）:
-        稼高, 基準額
-        400000, 122505
-        450000, 170255
-        ...
-    しきい値候補: ["稼高","営収","売上","threshold","sales"]
-    金額候補    : ["基準額","金額","amount","base","pay"]
-    """
-    repo_csv = Path(__file__).parent / "稼高水準別基準額と歩率.csv"
-    data_csv = DATA_DIR / "rate_table.csv"
-
-    def _read_csv(p: Path):
-        if not p.exists():
-            return None
-        try:
-            tmp = pd.read_csv(p)
-            cols = [c.strip() for c in tmp.columns]
-            thr_cands = ["稼高","営収","売上","threshold","sales"]
-            amt_cands = ["基準額","金額","amount","base","pay"]
-
-            thr_col = next((c for c in cols if any(k in c for k in thr_cands)), None)
-            amt_col = next((c for c in cols if any(k in c for k in amt_cands)), None)
-            if not thr_col or not amt_col:
-                return None
-
-            df_t = tmp[[thr_col, amt_col]].copy()
-            df_t.columns = ["thr","amt"]
-            df_t["thr"] = pd.to_numeric(df_t["thr"], errors="coerce").fillna(0).astype(int)
-            df_t["amt"] = pd.to_numeric(df_t["amt"], errors="coerce").fillna(0).astype(int)
-
-            df_t = df_t.sort_values("thr").reset_index(drop=True)
-            if df_t.iloc[0]["thr"] > 0:
-                df_t = pd.concat([pd.DataFrame([{"thr":0,"amt":0}]), df_t], ignore_index=True)
-
-            return list(df_t.itertuples(index=False, name=None))  # [(thr, amt), ...]
-        except Exception:
-            return None
-
-    for candidate in (repo_csv, data_csv):
-        table = _read_csv(candidate)
-        if table:
-            return table
-
-    # フォールバック（必要に応じて調整可）
-    fallback = [
-        (0,       0),
-        (400000, 122505),
-        (450000, 170255),
-        (500000, 211921),
-        (550000, 252054),
-        (600000, 288907),
-        (650000, 329678),
-        (700000, 369718),
-        (750000, 404286),
-        (800000, 438359),
-        (850000, 471015),
-        (900000, 508712),
-    ]
-    return fallback
-
-rate_table = load_rate_table()
-
-def calc_base_pay(total_sales: int, table: list[tuple[int,int]]) -> int:
-    """
-    テーブルは昇順（最低稼高→最高稼高）。
-    しきい値を超えるたびに金額を更新していく方式で、最低稼高から確実に反映。
-    """
-    base = 0
-    for thr, amt in table:
-        if total_sales >= thr:
-            base = amt
-        else:
-            break
-    return base
+# ====== CSVから歩合給テーブル読込 ======
+try:
+    rate_df = pd.read_csv("稼高水準別基準額と歩率.csv")
+    rate_df = rate_df.dropna()
+    rate_table = dict(zip(rate_df.iloc[:,0], rate_df.iloc[:,1]))  # {稼高: 基準額}
+except Exception as e:
+    st.error(f"歩合給テーブルのCSV読込に失敗しました: {e}")
+    rate_table = {}
 
 # ====== 給与計算 ======
 total_sales = int(df["営収"].sum()) if not df.empty else 0
 night_hours = float(df["深夜時間(h)"].sum()) if "深夜時間(h)" in df else 0.0
 over_hours  = float(df["超過時間(h)"].sum())  if "超過時間(h)" in df  else 0.0
 
-base_pay   = calc_base_pay(total_sales, rate_table)
-night_pay  = int(night_hours * 600)
-over_pay   = int(over_hours * 250)
-total_pay  = base_pay + night_pay + over_pay
-deduction  = int(total_pay * 0.115)
-take_home  = total_pay - deduction
+# 最低稼高から反映
+thresholds = sorted(rate_table.items(), key=lambda x: x[0])
+base_pay = thresholds[0][1] if thresholds else 0
+for thr, amt in thresholds:
+    if total_sales >= thr:
+        base_pay = amt
+    else:
+        break
+
+night_pay = int(night_hours * 600)
+over_pay  = int(over_hours * 250)
+total_pay = base_pay + night_pay + over_pay
+deduction = int(total_pay * 0.115)
+take_home = total_pay - deduction
 
 st.markdown("### 💰 給与予測結果")
 st.write(f"総営収：¥{total_sales:,}")
@@ -340,52 +180,7 @@ st.write(f"深夜手当：¥{night_pay:,}（{night_hours:.1f}時間）")
 st.write(f"超過手当：¥{over_pay:,}（{over_hours:.1f}時間）")
 st.write(f"支給合計：¥{total_pay:,}")
 st.write(f"控除（11.5%）：¥{deduction:,}")
-st.success(f"👉 手取り見込み：¥{take_home:,}")
-
-# ====== 15日締め：保存してクリア ======
-st.markdown("### 🗂 15日締め（保存してクリア）")
-today = datetime.today().date()
-p_start, p_end = period_16to15(today)
-st.caption(f"対象期間: {p_start} ～ {p_end}（毎月16日開始〜翌月15日締め）")
-
-df_entries = pd.DataFrame(ss.entries)
-if not df_entries.empty:
-    df_entries["日付_dt"] = pd.to_datetime(df_entries["日付"]).dt.date
-    mask = (df_entries["日付_dt"] >= p_start) & (df_entries["日付_dt"] <= p_end)
-    df_to_save = df_entries.loc[mask, COLUMNS]
-else:
-    mask = pd.Series([], dtype=bool)
-    df_to_save = pd.DataFrame(columns=COLUMNS)
-
-colA, colB = st.columns([1.4, 2])
-do_close = colA.button("📦 この期間を保存してクリア")
-if do_close:
-    if df_to_save.empty:
-        st.warning("対象期間のデータがありません。保存は行いませんでした。")
-    else:
-        out_path = archive_filename(p_start, p_end)
-        df_to_save.to_csv(out_path, index=False, encoding="utf-8-sig")
-        # 対象分のみ削除
-        remain = df_entries.loc[~mask, COLUMNS].to_dict(orient="records") if not df_entries.empty else []
-        ss.entries = remain
-        save_entries(ss.entries)
-        st.success(f"保存しました：{out_path.name}。対象分をクリアしました。")
-        st.rerun()
-
-st.markdown("#### 📚 アーカイブ一覧")
-arch_files = sorted(ARCHIVE_DIR.glob("entries_*.csv"))
-if not arch_files:
-    st.caption("まだアーカイブはありません。")
-else:
-    for p in arch_files[::-1]:
-        with open(p, "rb") as f:
-            st.download_button(
-                label=f"⬇️ {p.name}",
-                data=f.read(),
-                file_name=p.name,
-                mime="text/csv",
-                key=f"dl_{p.name}"
-            )
+st.success(f"👉 手取り金額：¥{take_home:,}")
 
 # ====== PDF 出力 ======
 def generate_pdf(df_src, total_sales, base_pay, night_pay, night_hours, over_pay, over_hours, deduction, take_home):
