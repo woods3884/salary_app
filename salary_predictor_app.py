@@ -9,7 +9,7 @@ from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 
-st.title("🚖 タクシー給与予測アプリ")
+st.title("🚖 給与予測アプリ")
 
 # ====== 永続化（Railway Volume） ======
 DATA_DIR = Path("/app/data")
@@ -99,7 +99,7 @@ if submitted:
     save_entries(ss.entries)
     st.success("追加しました。")
 
-# ====== 一覧・行別編集／削除（エントリがあるときだけ） ======
+# ====== 一覧・行別編集／削除 ======
 if ss.entries:
     df_list = pd.DataFrame(ss.entries)
     st.markdown("### 📝 入力済みデータ（行ごと編集/削除）")
@@ -238,27 +238,100 @@ st.markdown("### 📊 入力済みデータ")
 st.dataframe(df if not df.empty else pd.DataFrame(columns=COLUMNS + ["深夜時間(h)", "超過時間(h)"]),
              use_container_width=True)
 
-# ====== 給与計算（dfが空でも0で表示） ======
+# ====== 歩合基準テーブルの読み込み & 基準額計算 ======
+def load_rate_table():
+    """
+    優先順で歩合基準を読み込む:
+      1) リポジトリ同梱の '稼高水準別基準額と歩率.csv'
+      2) DATA_DIR 配下の 'rate_table.csv'
+      3) 既定のフォールバック
+
+    CSV 例（ヘッダは日本語/英語どちらでもOK）:
+        稼高, 基準額
+        400000, 122505
+        450000, 170255
+        ...
+    しきい値候補: ["稼高","営収","売上","threshold","sales"]
+    金額候補    : ["基準額","金額","amount","base","pay"]
+    """
+    repo_csv = Path(__file__).parent / "稼高水準別基準額と歩率.csv"
+    data_csv = DATA_DIR / "rate_table.csv"
+
+    def _read_csv(p: Path):
+        if not p.exists():
+            return None
+        try:
+            tmp = pd.read_csv(p)
+            cols = [c.strip() for c in tmp.columns]
+            thr_cands = ["稼高","営収","売上","threshold","sales"]
+            amt_cands = ["基準額","金額","amount","base","pay"]
+
+            thr_col = next((c for c in cols if any(k in c for k in thr_cands)), None)
+            amt_col = next((c for c in cols if any(k in c for k in amt_cands)), None)
+            if not thr_col or not amt_col:
+                return None
+
+            df_t = tmp[[thr_col, amt_col]].copy()
+            df_t.columns = ["thr","amt"]
+            df_t["thr"] = pd.to_numeric(df_t["thr"], errors="coerce").fillna(0).astype(int)
+            df_t["amt"] = pd.to_numeric(df_t["amt"], errors="coerce").fillna(0).astype(int)
+
+            df_t = df_t.sort_values("thr").reset_index(drop=True)
+            if df_t.iloc[0]["thr"] > 0:
+                df_t = pd.concat([pd.DataFrame([{"thr":0,"amt":0}]), df_t], ignore_index=True)
+
+            return list(df_t.itertuples(index=False, name=None))  # [(thr, amt), ...]
+        except Exception:
+            return None
+
+    for candidate in (repo_csv, data_csv):
+        table = _read_csv(candidate)
+        if table:
+            return table
+
+    # フォールバック（必要に応じて調整可）
+    fallback = [
+        (0,       0),
+        (400000, 122505),
+        (450000, 170255),
+        (500000, 211921),
+        (550000, 252054),
+        (600000, 288907),
+        (650000, 329678),
+        (700000, 369718),
+        (750000, 404286),
+        (800000, 438359),
+        (850000, 471015),
+        (900000, 508712),
+    ]
+    return fallback
+
+rate_table = load_rate_table()
+
+def calc_base_pay(total_sales: int, table: list[tuple[int,int]]) -> int:
+    """
+    テーブルは昇順（最低稼高→最高稼高）。
+    しきい値を超えるたびに金額を更新していく方式で、最低稼高から確実に反映。
+    """
+    base = 0
+    for thr, amt in table:
+        if total_sales >= thr:
+            base = amt
+        else:
+            break
+    return base
+
+# ====== 給与計算 ======
 total_sales = int(df["営収"].sum()) if not df.empty else 0
 night_hours = float(df["深夜時間(h)"].sum()) if "深夜時間(h)" in df else 0.0
 over_hours  = float(df["超過時間(h)"].sum())  if "超過時間(h)" in df  else 0.0
 
-rate_table = {
-    900000: 508712, 850000: 471015, 800000: 438359, 750000: 404286,
-    700000: 369718, 650000: 329678, 600000: 288907, 550000: 252054,
-    500000: 211921, 450000: 170255, 400000: 122505
-}
-base_pay = 0
-for thr, amt in sorted(rate_table.items(), reverse=True):
-    if total_sales >= thr:
-        base_pay = amt
-        break
-
-night_pay = int(night_hours * 600)
-over_pay  = int(over_hours * 250)
-total_pay = base_pay + night_pay + over_pay
-deduction = int(total_pay * 0.115)
-take_home = total_pay - deduction
+base_pay   = calc_base_pay(total_sales, rate_table)
+night_pay  = int(night_hours * 600)
+over_pay   = int(over_hours * 250)
+total_pay  = base_pay + night_pay + over_pay
+deduction  = int(total_pay * 0.115)
+take_home  = total_pay - deduction
 
 st.markdown("### 💰 給与予測結果")
 st.write(f"総営収：¥{total_sales:,}")
@@ -269,7 +342,7 @@ st.write(f"支給合計：¥{total_pay:,}")
 st.write(f"控除（11.5%）：¥{deduction:,}")
 st.success(f"👉 手取り見込み：¥{take_home:,}")
 
-# ====== 15日締め：保存してクリア（常に表示） ======
+# ====== 15日締め：保存してクリア ======
 st.markdown("### 🗂 15日締め（保存してクリア）")
 today = datetime.today().date()
 p_start, p_end = period_16to15(today)
